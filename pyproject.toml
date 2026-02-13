@@ -1,0 +1,35 @@
+[project]
+name = "scipher"
+version = "0.1.0"
+description = "Scipher: Single-cell type embedding from protein-level embedding"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.8.0",
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "anndata>=0.10.0",
+    "scanpy>=1.9.0",
+    "cellxgene-census>=1.17.0",
+    "tiledbsoma-ml>=0.1.0",
+    "pronto>=2.7.0",
+    "mygene",
+    "requests",
+    "tqdm",
+    "umap-learn>=0.5.9",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+proteinbert = [
+    "protein-bert>=1.0.0",
+    "tensorflow>=2.15.0,<2.16",
+]
+esm = [
+    "fair-esm",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

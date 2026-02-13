@@ -1,0 +1,40 @@
+# Data (top-level only, not scipher/data/ Python package)
+/data/
+*.h5ad
+*.npy
+*.pkl
+*.pt
+*.pth
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models
+models/
+
+# Claude Code context (private project notes)
+CLAUDE.md
