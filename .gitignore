@@ -1,4 +1,4 @@
-# Data (top-level only, not scipher/data/ Python package)
+# Data artifacts
 /data/
 *.h5ad
 *.npy

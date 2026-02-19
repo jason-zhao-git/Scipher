@@ -19,6 +19,7 @@ dependencies = [
     "tqdm",
     "umap-learn>=0.5.9",
     "matplotlib",
+    "ipykernel>=7.2.0",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +29,10 @@ proteinbert = [
 ]
 esm = [
     "fair-esm",
+]
+dev = [
+    "ipykernel",
+    "jupyter",
 ]
 
 [build-system]
