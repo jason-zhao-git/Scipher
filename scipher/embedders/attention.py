@@ -96,6 +96,15 @@ class CellDataset(Dataset):
 
         self.adata = self.adata[:, self.gene_list]
 
+        # Pre-extract expression matrix for fast __getitem__
+        # (AnnData fancy indexing per sample is extremely slow and
+        # bottlenecks DataLoader workers)
+        X = self.adata.X
+        if issparse(X):
+            self.X = X.tocsr()
+        else:
+            self.X = np.asarray(X)
+
     def get_gene_embeddings(self, device=None):
         """Get gene embeddings tensor (n_genes, embed_dim), optionally on device."""
         if device is not None:
@@ -106,7 +115,7 @@ class CellDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        expr = self.adata[idx].X
+        expr = self.X[idx]
         if issparse(expr):
             expr = expr.toarray().flatten()
         else:
