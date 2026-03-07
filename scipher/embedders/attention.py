@@ -59,9 +59,7 @@ class AttentionPooling(nn.Module):
 
         # Compute attention weights
         attn_scores = self.attention(gene_features).squeeze(-1)  # (batch, n_genes)
-        attn_scores = attn_scores.masked_fill(
-            ~expression_mask, torch.finfo(attn_scores.dtype).min
-        )
+        attn_scores = attn_scores.masked_fill(~expression_mask, -1e9)
         attn_weights = torch.softmax(attn_scores, dim=-1)  # (batch, n_genes)
 
         # Weighted pool: (batch, 1, n_genes) @ (batch, n_genes, embed_dim) -> (batch, embed_dim)
