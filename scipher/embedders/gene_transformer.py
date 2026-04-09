@@ -25,6 +25,7 @@ no gene subsampling, and expression-gated tokens.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class TransformerLayer(nn.Module):
@@ -203,9 +204,14 @@ class GeneTransformerEmbedder(nn.Module):
         cls_valid = torch.ones(batch_size, self.n_cls, 1, dtype=torch.bool, device=device)
         full_pad_mask = torch.cat([cls_valid, pad_mask], dim=1)  # (batch, n_cls+max_expressed, 1)
 
-        # Transformer layers — re-zero padded positions after each layer
+        # Transformer layers — gradient checkpointing to save memory
+        # (recomputes activations during backward instead of storing them)
+        # Re-zero padded positions after each layer to prevent leakage
         for layer in self.layers:
-            tokens = layer(tokens)
+            if self.training:
+                tokens = checkpoint(layer, tokens, use_reentrant=False)
+            else:
+                tokens = layer(tokens)
             tokens = tokens * full_pad_mask
 
         # Final norm
