@@ -10,7 +10,8 @@ Architecture:
     3. Gate by expression: token = proj(ESM2) * log1p_norm(expr)
     4. Prepend K learnable CLS tokens -> K+seq tokens
     5. Pre-norm dense self-attention (N layers, H heads)
-       with key_padding_mask for padded positions
+       — no attn_mask so SDPA uses flash attention (O(n) memory)
+       — padded positions zeroed after each layer to prevent leakage
     6. K CLS outputs -> concat -> Linear + LayerNorm -> cell embedding (output_dim)
 
 Multiple CLS tokens let the model learn K different "readout heads" that
@@ -27,7 +28,11 @@ import torch.nn.functional as F
 
 
 class TransformerLayer(nn.Module):
-    """Pre-norm transformer layer with flash attention."""
+    """Pre-norm transformer layer with flash attention.
+
+    No attn_mask is passed to SDPA so it uses the flash attention kernel
+    (O(n) memory). Padded positions must be zeroed externally after each layer.
+    """
 
     def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
         super().__init__()
@@ -48,11 +53,10 @@ class TransformerLayer(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x, key_padding_mask=None):
+    def forward(self, x):
         """
         Args:
-            x: (batch, seq, d_model)
-            key_padding_mask: (batch, seq) bool, True = VALID token, False = pad
+            x: (batch, seq, d_model) — padded positions should be zero
 
         Returns:
             (batch, seq, d_model)
@@ -67,15 +71,13 @@ class TransformerLayer(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Build attention mask: (batch, 1, 1, seq) for broadcasting
-        # sdpa expects: True = IGNORE (opposite of our convention)
-        attn_mask = None
-        if key_padding_mask is not None:
-            attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, seq)
-
+        # No attn_mask — enables flash attention (O(n) memory instead of O(n^2))
+        # Padded positions have zero vectors, so they contribute ~zero value.
+        # CLS tokens waste a small amount of attention on padding, which is
+        # an acceptable tradeoff for 8x memory reduction.
         dropout_p = self.attn_dropout if self.training else 0.0
         out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
+            q, k, v, dropout_p=dropout_p,
         )  # (batch, n_heads, seq, d_head)
         out = out.transpose(1, 2).reshape(batch, seq, d_model)
         out = self.W_O(out)
@@ -188,20 +190,23 @@ class GeneTransformerEmbedder(nn.Module):
         # Gate: token = proj(ESM2) * expression
         tokens = gathered_embs * gathered_expr.unsqueeze(-1)
 
-        # Zero out padded positions
-        tokens = tokens * seq_mask.unsqueeze(-1)
+        # Zero out padded positions (critical: flash attention has no mask,
+        # so padded positions must be zero to avoid contributing to attention)
+        pad_mask = seq_mask.unsqueeze(-1)  # (batch, max_expressed, 1)
+        tokens = tokens * pad_mask
 
         # Prepend CLS tokens
         cls = self.cls_tokens.expand(batch_size, -1, -1)  # (batch, n_cls, d_model)
         tokens = torch.cat([cls, tokens], dim=1)  # (batch, n_cls+max_expressed, d_model)
 
-        # Build key_padding_mask: True = valid, CLS tokens are always valid
-        cls_mask = torch.ones(batch_size, self.n_cls, dtype=torch.bool, device=device)
-        key_padding_mask = torch.cat([cls_mask, seq_mask], dim=1)
+        # Build full mask for re-zeroing: CLS positions are always valid
+        cls_valid = torch.ones(batch_size, self.n_cls, 1, dtype=torch.bool, device=device)
+        full_pad_mask = torch.cat([cls_valid, pad_mask], dim=1)  # (batch, n_cls+max_expressed, 1)
 
-        # Transformer layers
+        # Transformer layers — re-zero padded positions after each layer
         for layer in self.layers:
-            tokens = layer(tokens, key_padding_mask=key_padding_mask)
+            tokens = layer(tokens)
+            tokens = tokens * full_pad_mask
 
         # Final norm
         tokens = self.final_norm(tokens)
@@ -213,14 +218,13 @@ class GeneTransformerEmbedder(nn.Module):
 
         # Extract CLS->gene attention from last layer for interpretability
         gene_attn = self._extract_cls_attention(
-            tokens, key_padding_mask, gene_indices, seq_mask, n_genes,
+            tokens, gene_indices, seq_mask, n_genes,
         )
 
         return cell_embedding, gene_attn
 
     @torch.no_grad()
-    def _extract_cls_attention(self, tokens, key_padding_mask, gene_indices,
-                               seq_mask, n_genes):
+    def _extract_cls_attention(self, tokens, gene_indices, seq_mask, n_genes):
         """Extract CLS->gene attention weights from last layer, scattered to full gene dim.
 
         Averages attention over all CLS tokens and all heads.
@@ -243,9 +247,13 @@ class GeneTransformerEmbedder(nn.Module):
         scores = torch.matmul(q_cls, k_all.transpose(-2, -1)) / (layer.d_head ** 0.5)
         # scores: (batch, n_heads, n_cls, n_cls+max_expressed)
 
-        if key_padding_mask is not None:
-            pad_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(pad_mask, float("-inf"))
+        # Mask padded positions for accurate attention weights
+        full_mask = torch.cat([
+            torch.ones(batch_size, self.n_cls, dtype=torch.bool, device=device),
+            seq_mask,
+        ], dim=1)
+        pad_mask = ~full_mask.unsqueeze(1).unsqueeze(2)
+        scores = scores.masked_fill(pad_mask, float("-inf"))
 
         attn = F.softmax(scores, dim=-1)
         # Average over heads and CLS tokens, drop CLS->CLS positions
