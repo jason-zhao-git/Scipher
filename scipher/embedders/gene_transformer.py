@@ -64,28 +64,31 @@ class TransformerLayer(nn.Module):
         """
         batch, seq, d_model = x.shape
 
-        # Pre-norm attention
-        h = self.norm1(x)
-        qkv = self.W_QKV(h).reshape(batch, seq, 3, self.n_heads, self.d_head)
-        q, k, v = qkv.unbind(dim=2)  # each (batch, seq, n_heads, d_head)
-        q = q.transpose(1, 2)  # (batch, n_heads, seq, d_head)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        # bf16 autocast: required for flash attention (SDPA only uses flash
+        # kernel in half precision). Also halves memory for FFN intermediates.
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=x.is_cuda):
+            # Pre-norm attention
+            h = self.norm1(x)
+            qkv = self.W_QKV(h).reshape(batch, seq, 3, self.n_heads, self.d_head)
+            q, k, v = qkv.unbind(dim=2)  # each (batch, seq, n_heads, d_head)
+            q = q.transpose(1, 2)  # (batch, n_heads, seq, d_head)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
 
-        # No attn_mask — enables flash attention (O(n) memory instead of O(n^2))
-        # Padded positions have zero vectors, so they contribute ~zero value.
-        # CLS tokens waste a small amount of attention on padding, which is
-        # an acceptable tradeoff for 8x memory reduction.
-        dropout_p = self.attn_dropout if self.training else 0.0
-        out = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=dropout_p,
-        )  # (batch, n_heads, seq, d_head)
-        out = out.transpose(1, 2).reshape(batch, seq, d_model)
-        out = self.W_O(out)
-        x = x + out
+            # No attn_mask — enables flash attention (O(n) memory instead of O(n^2))
+            # Padded positions have zero vectors, so they contribute ~zero value.
+            # CLS tokens waste a small amount of attention on padding, which is
+            # an acceptable tradeoff for massive memory reduction.
+            dropout_p = self.attn_dropout if self.training else 0.0
+            out = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=dropout_p,
+            )  # (batch, n_heads, seq, d_head)
+            out = out.transpose(1, 2).reshape(batch, seq, d_model)
+            out = self.W_O(out)
+            x = x + out
 
-        # Pre-norm FFN
-        x = x + self.ffn(self.norm2(x))
+            # Pre-norm FFN
+            x = x + self.ffn(self.norm2(x))
 
         return x
 
