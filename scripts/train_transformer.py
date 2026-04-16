@@ -12,6 +12,7 @@ Or directly:
 
 import sys
 import logging
+import math
 import pickle
 import time
 from pathlib import Path
@@ -47,22 +48,31 @@ HIERARCHY_DATE = "2026-01-29"
 ROOT_CL_ID = "CL:0000988"  # blood cells
 SOMA_URI = "/scratch/sigbio_project_root/sigbio_project25/jingqiao/mccell-single/soma_db_homo_sapiens"
 MIN_CELL_COUNT = 50
-BATCH_SIZE = 32       # per GPU (conservative: variable seq length can spike memory)
-LR = 1e-4
+BATCH_SIZE = 64       # per GPU (smaller model fits 64 comfortably on A40)
 LEAF_WEIGHT = 7.0
 GRAD_CLIP = 1.0
-EPOCHS = 10
+EPOCHS = 4
 SEED = 42
 NUM_WORKERS = 3
 
-# Model — scaled down from 768 to 512 for safe memory margins (~20GB/GPU)
+# GeneTransformerEmbedder hyperparameters
 D_MODEL = 512
 N_LAYERS = 4
 N_HEADS = 8
 N_CLS = 8
 D_FF = 2048
-OUTPUT_DIM = 512
+OUTPUT_DIM = 256
 DROPOUT = 0.1
+
+# Phase 1: classifier warmup (frozen embedder)
+CLASSIFIER_WARMUP_STEPS = 1000
+CLASSIFIER_WARMUP_LR = 1e-3
+
+# Phase 2: full training with LR warmup + cosine decay
+PEAK_LR = 2e-4
+MIN_LR = 1e-5
+LR_WARMUP_STEPS = 500
+WEIGHT_DECAY = 0.01
 
 
 # ============================================================
@@ -92,7 +102,7 @@ logger = logging.getLogger(__name__)
 class ScipherModel(nn.Module):
     def __init__(self, embed_dim, num_leaves, gene_embs,
                  d_model=512, n_layers=4, n_heads=8, n_cls=8,
-                 d_ff=2048, output_dim=512, dropout=0.1):
+                 d_ff=2048, output_dim=256, dropout=0.1):
         super().__init__()
         self.embedder = GeneTransformerEmbedder(
             gene_embed_dim=embed_dim, d_model=d_model, output_dim=output_dim,
@@ -255,7 +265,6 @@ def main():
         leaf_values, internal_values, mapping_dict,
         leaf_weight=LEAF_WEIGHT, device=device,
     )
-    optimizer = optim.Adam(model.parameters(), lr=LR)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"ScipherModel: {n_params:,} trainable parameters")
@@ -265,13 +274,88 @@ def main():
         reserved = torch.cuda.memory_reserved() / 1e9
         logger.info(f"GPU memory after model load: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved")
 
-    # --- Training ---
-    loss_history = {"total": [], "leaf": [], "parent": []}
-    epoch_times = []
+    # Helper: process one batch
+    def process_batch(X_batch, obs_batch):
+        X = torch.from_numpy(X_batch) if isinstance(X_batch, np.ndarray) else torch.from_numpy(X_batch.toarray())
+        X = X.float()
+        X_mapped = X[:, col_indices]
+        mask = (X_mapped > 0).to(device)
+        X_log = torch.log1p(X_mapped)
+        expr_sum = X_log.sum(dim=1, keepdim=True).clamp(min=1e-10)
+        expression = (X_log / expr_sum).to(device)
+        labels = obs_batch["cell_type_ontology_term_id"].values
+        y_batch = torch.tensor(
+            [mapping_dict[t] for t in labels], device=device, dtype=torch.long,
+        )
+        return expression, mask, y_batch
 
-    logger.info(f"Training: {EPOCHS} epochs")
+    # --- Phase 1: Classifier warmup (frozen embedder) ---
+    logger.info("=" * 70)
+    logger.info(f"PHASE 1: Classifier warmup ({CLASSIFIER_WARMUP_STEPS} steps, embedder frozen)")
+    logger.info("=" * 70)
+
+    _model = model.module if isinstance(model, nn.DataParallel) else model
+    _model.embedder.requires_grad_(False)
+
+    warmup_optimizer = optim.Adam(
+        [p for p in model.parameters() if p.requires_grad], lr=CLASSIFIER_WARMUP_LR,
+    )
+
+    model.train()
+    warmup_losses = []
+    warmup_start = time.time()
+
+    for i, (X_batch, obs_batch) in enumerate(train_loader):
+        if i >= CLASSIFIER_WARMUP_STEPS:
+            break
+
+        expression, mask, y_batch = process_batch(X_batch, obs_batch)
+
+        warmup_optimizer.zero_grad()
+        logits, _, _ = model(expression, mask)
+        total_loss, loss_leafs, loss_parents = loss_fn(logits, y_batch)
+        total_loss.backward()
+        clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
+        warmup_optimizer.step()
+
+        warmup_losses.append(total_loss.item())
+
+        if (i + 1) % 200 == 0:
+            avg_recent = np.mean(warmup_losses[-200:])
+            logger.info(f"  [Warmup step {i+1}/{CLASSIFIER_WARMUP_STEPS}] Loss: {total_loss.item():.4f} (avg: {avg_recent:.4f})")
+
+    warmup_time = time.time() - warmup_start
+    logger.info(f"Phase 1 done: {len(warmup_losses)} steps, avg loss {np.mean(warmup_losses):.4f}, time {warmup_time:.1f}s")
+
+    _model.embedder.requires_grad_(True)
+    del warmup_optimizer
+
+    # --- Phase 2: Full training with LR warmup + cosine decay ---
+    logger.info("=" * 70)
+    logger.info(f"PHASE 2: Full training ({EPOCHS} epochs, AdamW + cosine LR schedule)")
+    logger.info("=" * 70)
+
+    optimizer = optim.AdamW(model.parameters(), lr=PEAK_LR, weight_decay=WEIGHT_DECAY)
+
+    steps_per_epoch = train_ds.shape[0]
+    total_steps = EPOCHS * steps_per_epoch
+
+    def lr_lambda(current_step):
+        if current_step < LR_WARMUP_STEPS:
+            return current_step / max(LR_WARMUP_STEPS, 1)
+        progress = (current_step - LR_WARMUP_STEPS) / max(total_steps - LR_WARMUP_STEPS, 1)
+        return max(MIN_LR / PEAK_LR, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    logger.info(f"Steps/epoch: {steps_per_epoch:,}, total steps: {total_steps:,}")
+    logger.info(f"LR schedule: 0 -> {PEAK_LR} (warmup {LR_WARMUP_STEPS} steps) -> {MIN_LR} (cosine)")
     logger.info(f"Saving checkpoints to: {checkpoint_dir}")
     logger.info("-" * 70)
+
+    loss_history = {"total": [], "leaf": [], "parent": []}
+    epoch_times = []
+    global_step = 0
 
     for epoch in range(EPOCHS):
         model.train()
@@ -280,20 +364,7 @@ def main():
         epoch_losses = []
 
         for i, (X_batch, obs_batch) in enumerate(train_loader):
-            X = torch.from_numpy(X_batch) if isinstance(X_batch, np.ndarray) else torch.from_numpy(X_batch.toarray())
-            X = X.float()
-
-            X_mapped = X[:, col_indices]
-            mask = (X_mapped > 0).to(device)
-
-            X_log = torch.log1p(X_mapped)
-            expr_sum = X_log.sum(dim=1, keepdim=True).clamp(min=1e-10)
-            expression = (X_log / expr_sum).to(device)
-
-            labels = obs_batch["cell_type_ontology_term_id"].values
-            y_batch = torch.tensor(
-                [mapping_dict[t] for t in labels], device=device, dtype=torch.long,
-            )
+            expression, mask, y_batch = process_batch(X_batch, obs_batch)
 
             optimizer.zero_grad()
             logits, _, _ = model(expression, mask)
@@ -301,19 +372,22 @@ def main():
             total_loss.backward()
             clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
             optimizer.step()
+            scheduler.step()
 
             loss_history["total"].append(total_loss.item())
             loss_history["leaf"].append(loss_leafs.item())
             loss_history["parent"].append(loss_parents.item())
             epoch_losses.append(total_loss.item())
+            global_step += 1
 
             if (i + 1) % 50 == 0:
                 avg_recent = np.mean(epoch_losses[-50:])
+                current_lr = scheduler.get_last_lr()[0]
                 mem_alloc = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
                 logger.info(
                     f"  [Epoch {epoch+1}/{EPOCHS}, Batch {i+1}] "
                     f"Loss: {total_loss.item():.4f} (avg: {avg_recent:.4f}) "
-                    f"GPU mem: {mem_alloc:.1f}GB"
+                    f"lr: {current_lr:.2e} GPU mem: {mem_alloc:.1f}GB"
                 )
 
         epoch_time = time.time() - epoch_start
@@ -326,7 +400,9 @@ def main():
             "epoch": epoch + 1,
             "model_state_dict": state_dict,
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
             "loss_history": {k: list(v) for k, v in loss_history.items()},
+            "warmup_losses": warmup_losses,
             "epoch_times": list(epoch_times),
             "config": {
                 "input_dim": embed_dim, "output_dim": OUTPUT_DIM,
@@ -335,16 +411,23 @@ def main():
                 "embedder_class": "GeneTransformerEmbedder",
                 "d_model": D_MODEL, "n_layers": N_LAYERS, "n_heads": N_HEADS,
                 "n_cls": N_CLS, "d_ff": D_FF, "dropout": DROPOUT,
-                "lr": LR, "batch_size": BATCH_SIZE, "leaf_weight": LEAF_WEIGHT,
+                "peak_lr": PEAK_LR, "min_lr": MIN_LR,
+                "lr_warmup_steps": LR_WARMUP_STEPS, "weight_decay": WEIGHT_DECAY,
+                "classifier_warmup_steps": CLASSIFIER_WARMUP_STEPS,
+                "classifier_warmup_lr": CLASSIFIER_WARMUP_LR,
+                "batch_size": BATCH_SIZE, "leaf_weight": LEAF_WEIGHT,
                 "num_gpus": num_gpus,
             },
         }
         ckpt_path = checkpoint_dir / f"epoch{epoch+1:02d}.pt"
-        torch.save(ckpt, ckpt_path)
+        tmp_path = checkpoint_dir / f"epoch{epoch+1:02d}.pt.tmp"
+        torch.save(ckpt, tmp_path)
+        tmp_path.rename(ckpt_path)  # atomic on POSIX
 
+        current_lr = scheduler.get_last_lr()[0]
         logger.info(
             f"Epoch {epoch+1}/{EPOCHS} -- avg loss: {avg_loss:.4f}, "
-            f"time: {epoch_time:.1f}s, saved: {ckpt_path.name}"
+            f"lr: {current_lr:.2e}, time: {epoch_time:.1f}s, saved: {ckpt_path.name}"
         )
 
     # --- Validation ---
@@ -354,19 +437,7 @@ def main():
 
     with torch.no_grad():
         for X_batch, obs_batch in val_loader:
-            X = torch.from_numpy(X_batch) if isinstance(X_batch, np.ndarray) else torch.from_numpy(X_batch.toarray())
-            X = X.float()
-
-            X_mapped = X[:, col_indices]
-            mask = (X_mapped > 0).to(device)
-            X_log = torch.log1p(X_mapped)
-            expr_sum = X_log.sum(dim=1, keepdim=True).clamp(min=1e-10)
-            expression = (X_log / expr_sum).to(device)
-
-            labels = obs_batch["cell_type_ontology_term_id"].values
-            y_batch = torch.tensor(
-                [mapping_dict[t] for t in labels], device=device, dtype=torch.long,
-            )
+            expression, mask, y_batch = process_batch(X_batch, obs_batch)
 
             logits, _, _ = model(expression, mask)
             preds = torch.argmax(logits, dim=1)
