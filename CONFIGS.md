@@ -39,17 +39,17 @@ Results (epoch 1, 50K val cells):
 | output_dim | 256 |
 | dropout | 0.1 |
 | **Total params** | **~21M** (~15M embedder + ~6M classifier) |
-| batch_size | 96/GPU (384 effective) |
+| batch_size | 64/GPU (256 effective) |
 | optimizer | Phase 1: Adam lr=1e-3 (classifier warmup, 1000 steps) |
 |  | Phase 2: AdamW, peak_lr=2e-4, min_lr=1e-5, weight_decay=0.01 |
 | LR schedule | Linear warmup (500 steps) + cosine decay |
-| GPU memory | ~24-28GB/GPU (~60% at batch_size=64) |
-| Est. time/epoch | ~35-40 hours (at batch_size=96) |
-| Target | 4 epochs in ~160 hours |
+| GPU memory | ~24-28GB/GPU at batch_size=64 (~60%) |
+| Est. time/epoch | ~47 hours |
+| Target | 4 epochs in ~190 hours |
 
 ## Notes
 
 - SOMA data streaming is the bottleneck (~2.1s of ~2.2s per batch), not GPU compute
 - Larger batch size = fewer batches/epoch = primary speedup lever
 - Model reduction mainly frees GPU memory to enable larger batch sizes
-- A40s have 46GB each; at 60% usage with batch_size=64, batch_size=96 should fit (~70-80%)
+- **batch_size=96/GPU OOMs on peak batches** — variable sequence length (cells expressing 3-4K genes) causes memory spikes up to 44.9GB on A40 (46GB). 64/GPU is the safe max.
