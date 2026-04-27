@@ -44,8 +44,21 @@ Results (epoch 1, 50K val cells):
 |  | Phase 2: AdamW, peak_lr=2e-4, min_lr=1e-5, weight_decay=0.01 |
 | LR schedule | Linear warmup (500 steps) + cosine decay |
 | GPU memory | ~24-28GB/GPU at batch_size=64 (~60%) |
-| Est. time/epoch | ~47 hours |
-| Target | 4 epochs in ~190 hours |
+| Est. time/epoch | ~47 hours (4 GPUs), ~25-30 hours (8 GPUs) |
+
+Results (epoch 2, 50K val cells):
+- Micro F1: 0.6717, Macro F1: 0.1924, Weighted F1: 0.7049
+- Worse than Config A epoch 1 (micro 0.75, macro 0.21, weighted 0.79)
+
+## Comparison
+
+| Metric | Config A (epoch 1) | Config B (epoch 2) |
+|--------|-------------------|-------------------|
+| Micro F1 | **0.7534** | 0.6717 |
+| Macro F1 | **0.2078** | 0.1924 |
+| Weighted F1 | **0.7923** | 0.7049 |
+| Params | 54.6M | 21M |
+| Time/epoch | ~83h (4 GPU) | ~47h (4 GPU) |
 
 ## Notes
 
