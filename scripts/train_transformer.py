@@ -48,20 +48,20 @@ HIERARCHY_DATE = "2026-01-29"
 ROOT_CL_ID = "CL:0000988"  # blood cells
 SOMA_URI = "/scratch/sigbio_project_root/sigbio_project25/jingqiao/mccell-single/soma_db_homo_sapiens"
 MIN_CELL_COUNT = 50
-BATCH_SIZE = 64       # per GPU (96 OOMs on peak batches — variable seq length)
+BATCH_SIZE = 32       # per GPU (Config A large model needs 32 to stay safe on A40)
 LEAF_WEIGHT = 7.0
 GRAD_CLIP = 1.0
 EPOCHS = 4
 SEED = 42
 NUM_WORKERS = 3
 
-# GeneTransformerEmbedder hyperparameters
-D_MODEL = 512
-N_LAYERS = 4
-N_HEADS = 8
-N_CLS = 8
-D_FF = 2048
-OUTPUT_DIM = 256
+# GeneTransformerEmbedder hyperparameters (Config A: large model)
+D_MODEL = 768
+N_LAYERS = 6
+N_HEADS = 12
+N_CLS = 12
+D_FF = 3072
+OUTPUT_DIM = 512
 DROPOUT = 0.1
 
 # Phase 1: classifier warmup (frozen embedder)
@@ -101,8 +101,8 @@ logger = logging.getLogger(__name__)
 # ============================================================
 class ScipherModel(nn.Module):
     def __init__(self, embed_dim, num_leaves, gene_embs,
-                 d_model=512, n_layers=4, n_heads=8, n_cls=8,
-                 d_ff=2048, output_dim=256, dropout=0.1):
+                 d_model=768, n_layers=6, n_heads=12, n_cls=12,
+                 d_ff=3072, output_dim=512, dropout=0.1):
         super().__init__()
         self.embedder = GeneTransformerEmbedder(
             gene_embed_dim=embed_dim, d_model=d_model, output_dim=output_dim,

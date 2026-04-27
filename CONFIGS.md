@@ -46,9 +46,10 @@ Results (epoch 1, 50K val cells):
 | GPU memory | ~24-28GB/GPU at batch_size=64 (~60%) |
 | Est. time/epoch | ~47 hours (4 GPUs), ~25-30 hours (8 GPUs) |
 
-Results (epoch 2, 50K val cells):
-- Micro F1: 0.6717, Macro F1: 0.1924, Weighted F1: 0.7049
-- Worse than Config A epoch 1 (micro 0.75, macro 0.21, weighted 0.79)
+Results (50K val cells):
+- Epoch 1: Micro F1: 0.3727, Macro F1: 0.1242, Weighted F1: 0.4389
+- Epoch 2: Micro F1: 0.6717, Macro F1: 0.1924, Weighted F1: 0.7049
+- Learning fast (acc nearly doubled epoch 1→2) but still worse than Config A at epoch 1
 
 ## Comparison
 
@@ -59,6 +60,32 @@ Results (epoch 2, 50K val cells):
 | Weighted F1 | **0.7923** | 0.7049 |
 | Params | 54.6M | 21M |
 | Time/epoch | ~83h (4 GPU) | ~47h (4 GPU) |
+
+## Config C: Large + Blood Cells + New Recipe (current run)
+
+8x A40 GPUs, 200 hours. Config A architecture + new training recipe (warmup + cosine LR).
+
+| Parameter | Value |
+|-----------|-------|
+| d_model | 768 |
+| n_layers | 6 |
+| n_heads | 12 |
+| n_cls | 12 |
+| d_ff | 3072 |
+| output_dim | 512 |
+| dropout | 0.1 |
+| **Total params** | **54.6M** (48.2M embedder + 6.3M classifier) |
+| batch_size | 32/GPU (256 effective on 8 GPUs) |
+| optimizer | Phase 1: Adam lr=1e-3 (classifier warmup, 1000 steps) |
+|  | Phase 2: AdamW, peak_lr=2e-4, min_lr=1e-5, weight_decay=0.01 |
+| LR schedule | Linear warmup (500 steps) + cosine decay |
+| Hierarchy | CL:0000988 (blood cells): 61 leaves, 43 internal, 104 total |
+| GPU memory | ~36GB/GPU at batch_size=32 (proven safe from Config A) |
+| Est. time/epoch | ~40-45 hours (8 GPUs) |
+| Target | 4-5 epochs in 200 hours |
+
+Differences from Config A: classifier warmup, AdamW (not Adam), LR schedule, 8 GPUs.
+Same model, same data — tests whether the new training recipe improves over plain Adam.
 
 ## Notes
 
