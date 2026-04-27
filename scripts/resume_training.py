@@ -287,9 +287,22 @@ def main():
         return max(MIN_LR / PEAK_LR, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    if "scheduler_state_dict" in ckpt:
+
+    # Restore scheduler: if GPU count or epochs changed, the old step count
+    # doesn't match the new schedule. Recompute from completed epochs instead.
+    old_num_gpus = cfg.get("num_gpus", num_gpus)
+    old_epochs = cfg.get("epochs", EPOCHS)
+    if old_num_gpus == num_gpus and old_epochs == EPOCHS and "scheduler_state_dict" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        logger.info("Restored scheduler state")
+        logger.info("Restored scheduler state (same GPU count and epochs)")
+    else:
+        # Fast-forward scheduler to the correct step for completed epochs
+        resume_step = start_epoch * steps_per_epoch
+        for _ in range(resume_step):
+            scheduler.step()
+        logger.info(f"Rebuilt scheduler for {num_gpus} GPUs / {EPOCHS} epochs "
+                     f"(was {old_num_gpus} GPUs / {old_epochs} epochs), "
+                     f"fast-forwarded to step {resume_step:,}")
 
     # --- Restore loss history ---
     loss_history = ckpt.get("loss_history", {"total": [], "leaf": [], "parent": []})
